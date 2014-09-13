@@ -4,9 +4,10 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
-	"github.com/akrennmair/gopcap"
 	"os"
 	"time"
+
+	pcap "github.com/heartszhang/pcapsplit/gopcap"
 )
 
 var (
