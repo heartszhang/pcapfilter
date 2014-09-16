@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	pcap "github.com/heartszhang/pcapsplit/gopcap"
@@ -16,7 +17,7 @@ var (
 )
 
 func init() {
-	flag.StringVar(&server_ip, "server-ip", "114.66.198.5", "114.66.198.5")
+	flag.StringVar(&server_ip, "server-ip", "123.125.20.36", "114.66.198.5")
 	flag.StringVar(&input_file, "input", "target.cap", "pcap file")
 }
 
@@ -32,9 +33,15 @@ type session_stat struct {
 	sent_length int
 	req_length  int
 	rsp_length  int
-	key         string
-	sent_sn     uint32
-	rcvd_sn     uint32
+	//	key         string
+	sent_start   uint32
+	rcvd_start   uint32
+	sent_no      uint32
+	rcvd_no      uint32
+	sent_retrans int
+	rcvd_retrans int
+	pkt_rcvd     int
+	pkt_sent     int
 }
 
 func duration_milli(end, begin time.Time) int64 {
@@ -50,7 +57,32 @@ const (
 	ss_fin_sent
 )
 
+type statis struct {
+	syn_count,
+	psh_count,
+	fin_count,
+	pkt_count,
+	cnn_count int
+}
+
+func (this statis) String() string {
+	return fmt.Sprintf("syn %v psh %v fin %v pkt %v connection %v", this.syn_count, this.psh_count, this.fin_count, this.pkt_count, this.cnn_count)
+}
+func statis_session(sess session_stat, s *statis) {
+	s.cnn_count++
+	if sess.flags&ss_syn_rcvd != 0 {
+		s.syn_count++
+	}
+	if sess.flags&(ss_fin_rcvd|ss_fin_sent) != 0 {
+		s.fin_count++
+	}
+	if sess.flags&ss_push_rcvd != 0 {
+		s.psh_count++
+	}
+}
+
 func split_pcap(input, svrip string) error {
+	var s statis
 	sns := make(map[string]session_stat)
 
 	f, err := os.Open(input)
@@ -83,26 +115,47 @@ func split_pcap(input, svrip string) error {
 		}
 		sess := sns[key]
 
+		if rcvd {
+			sess.pkt_rcvd++
+		} else {
+			sess.pkt_sent++
+		}
+		s.pkt_count++
 		if rcvd == true && pkt.TCP.Flags&pcap.TCP_SYN != 0 && sess.flags&ss_syn_rcvd == 0 {
-			sess.id++
-			sess.flags = 0
+			if sess.id != 0 {
+				statis_session(sess, &s)
+				diagnose_session(sess)
+			}
+			sess = session_stat{id: sess.id + 1}
 			sess.syn_tm = pkt.Time
 			sess.flags |= ss_syn_rcvd
-			sess.rcvd_sn = pkt.TCP.Seq
-			sess.sent_sn = 0
-			sess.rcvd_length = 0
-			sess.sent_length = 0
-			sess.key = key
+			sess.rcvd_start = pkt.TCP.Seq
+			//			sess.key = key
 		}
+
 		if sent == true && pkt.TCP.Flags&pcap.TCP_SYN != 0 && sess.flags&ss_syn_sent == 0 {
 			sess.flags |= ss_syn_sent
-			sess.sent_sn = pkt.TCP.Seq
+			sess.sent_start = pkt.TCP.Seq
+		}
+		if sess.flags&(ss_fin_rcvd|ss_fin_sent) == ss_fin_rcvd|ss_fin_sent {
+			continue
 		}
 		payload := pkt.IP.Len() - int(pkt.IP.Ihl*4) - int(pkt.TCP.DataOffset*4)
-		rseq := pkt.TCP.Seq - sess.rcvd_sn
-
+		rseq := pkt.TCP.Seq - sess.rcvd_start
+		if rcvd && rseq > 0 {
+			if rseq < sess.rcvd_no {
+				sess.rcvd_retrans++
+			} else {
+				sess.rcvd_no = rseq
+			}
+		}
 		if sent {
-			rseq = pkt.TCP.Seq - sess.sent_sn
+			rseq = pkt.TCP.Seq - sess.sent_start
+			if rseq > 0 && rseq < sess.sent_no {
+				sess.sent_retrans++
+			} else if rseq > 0 {
+				sess.sent_no = rseq
+			}
 		}
 		if rcvd == true && pkt.TCP.Flags&pcap.TCP_PSH != 0 && (sess.flags&ss_push_rcvd) == 0 {
 			sess.flags |= ss_push_rcvd
@@ -123,20 +176,23 @@ func split_pcap(input, svrip string) error {
 			sess.sfin_tm = pkt.Time
 		}
 
-		if sent == true && sess.rcvd_length < int(rseq) {
-			sess.rcvd_length = int(rseq)
-		}
-		if rcvd == true && sess.sent_length < int(rseq) {
+		if sent == true && sess.sent_length < int(rseq) {
 			sess.sent_length = int(rseq)
+		}
+		if rcvd == true && sess.rcvd_length < int(rseq) {
+			sess.rcvd_length = int(rseq)
 		}
 
 		if is_session_ok(sess) {
 			fmt.Println(sess)
-			sess.flags = 0
 		}
 		sns[key] = sess
 
 	}
+	for _, v := range sns {
+		statis_session(v, &s)
+	}
+	fmt.Println(s)
 	return nil
 }
 
@@ -151,7 +207,31 @@ func (this session_stat) String() string {
 		h  = duration_milli(this.rsp_tm, this.req_tm)
 		hs = duration_milli(this.rfin_tm, this.req_tm)
 	)
-	return fmt.Sprint("du ", d, " handle ", h, " handle-sent ", hs, " rcvd-len ", this.rcvd_length, " sent-len ", this.sent_length, " req-len ", this.req_length, " resp-len ", this.rsp_length, " ", this.key, " id ", this.id)
+	return fmt.Sprint("du ", d, " handle ", h, " handle-sent ", hs, " rcvd-len ", this.rcvd_length, " sent-len ", this.sent_length, " req-len ", this.req_length, " resp-len ", this.rsp_length)
+}
+
+func diagnose_session(this session_stat) string {
+	var flags []string
+	if this.flags&ss_syn_rcvd != 0 {
+		flags = append(flags, "syn-rcvd")
+	}
+	if this.flags&ss_syn_sent != 0 {
+		flags = append(flags, "syn-sent")
+	}
+	if this.flags&ss_push_rcvd != 0 {
+		flags = append(flags, "psh-rcvd")
+	}
+	if this.flags&ss_push_sent != 0 {
+		flags = append(flags, "psh-sent")
+	}
+	return fmt.Sprint(strings.Join(flags, " "))
+	/*	ss_syn_rcvd
+		ss_syn_sent
+		ss_push_rcvd
+		ss_push_sent
+		ss_fin_rcvd
+		ss_fin_sent
+	*/
 }
 
 func main() {
@@ -161,8 +241,7 @@ func main() {
 		fmt.Errorf(input_file, "not exists")
 		return
 	}
-	err := split_pcap(input_file, server_ip)
-	fmt.Println(err)
+	split_pcap(input_file, server_ip)
 }
 
 func u16_to_string(v uint16) string {
